@@ -112,17 +112,68 @@ def fetch_excel_file() -> str:
             logger.warning("Error during cleanup", error=str(cleanup_error))
 
 @tracer.capture_method
+def get_last_contest() -> int:
+    """
+    Consulta a API para obter o número do último concurso salvo.
+    Retorna 0 se não houver resultados (404) para importar todos os concursos.
+    """
+    logger.info("Getting last contest number from API")
+    
+    api_url = os.environ.get('API_URL')
+    if not api_url:
+        logger.error("API_URL environment variable not set")
+        raise Exception("API_URL environment variable not set")
+
+    # Obtém o token de acesso
+    access_token = login_api()
+    
+    headers = {
+        'Authorization': f'Bearer {access_token}'
+    }
+    
+    try:
+        response = requests.get(f"{api_url}/lotofacil/last", headers=headers)
+        
+        # Se retornar 404, significa que não há resultados ainda
+        if response.status_code == 404:
+            logger.info("No results found in API (404), will import all contests")
+            return 0
+            
+        response.raise_for_status()
+        
+        data = response.json()
+        last_contest = data.get('concurso', 0)
+        
+        logger.info("Last contest number retrieved", last_contest=last_contest)
+        return last_contest
+        
+    except requests.exceptions.RequestException as e:
+        # Se não for 404, é um erro que precisa ser tratado
+        logger.error("Failed to get last contest", error=str(e))
+        raise Exception(f"Failed to get last contest: {str(e)}")
+
+@tracer.capture_method
 def map_excel_data(file_path: str) -> SaveResultsDto:
     logger.info("Starting Excel data mapping", file_path=file_path)
+    
+    # Obtém o último concurso da API
+    last_contest = get_last_contest()
+    logger.info("Filtering contests newer than", last_contest=last_contest)
     
     from mapper import map_excel_to_dto
     df = pd.read_excel(file_path)
     logger.info("Excel file loaded successfully", rows_count=len(df))
     
-    # Adicionando log das colunas
-    logger.info("DataFrame columns", columns=list(df.columns))
+    # Filtra apenas os concursos mais recentes que o último
+    df_filtered = df[df['Concurso'] > last_contest]
+    new_contests_count = len(df_filtered)
     
-    results = map_excel_to_dto(df)
+    if new_contests_count == 0:
+        logger.info("No new contests to process")
+        return SaveResultsDto(results=[])
+    
+    logger.info("Found new contests to process", count=new_contests_count)
+    results = map_excel_to_dto(df_filtered)
     logger.info("Data mapped to DTO successfully", results_count=len(results.results))
     
     os.unlink(file_path)
@@ -175,6 +226,10 @@ def login_api() -> str:
 
 @tracer.capture_method
 def send_to_api(data: SaveResultsDto) -> None:
+    if not data.results:
+        logger.info("No data to send to API")
+        return
+        
     logger.info("Starting API data submission", records_count=len(data.results))
     
     api_url = os.environ.get('API_URL')
